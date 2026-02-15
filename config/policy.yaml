@@ -1,0 +1,26 @@
+# =============================================================
+# Symbioz Runtime Policy
+# =============================================================
+# Edit this file to change system behavior without restart.
+# The GovernanceEngine hot-reloads on demand.
+#
+# Modes:
+#   development - max logging, relaxed thresholds, no signatures
+#   production  - strict invariants, rate-limiting, signed intents
+#   paranoid    - high consensus quorum, VM sandbox, minimal trust
+#   forensic   - read-only, deep analysis, replay-only
+# =============================================================
+
+mode: "production"
+cognitive_speed: 1.0          # Processing speed multiplier (0.5 - 4.0)
+
+# Consensus & SSAI
+ssai_threshold: 0.7           # AI confidence required (0.0 - 1.0)
+quorum_ratio: 0.67            # 2/3 node votes required
+consensus_timeout_ms: 2500    # Max wait for consensus (ms)
+
+# Security & Resources
+max_fuel_per_intent: 350000   # Computation limit per intent
+p2p_rate_limit: 150           # Requests/sec per peer
+require_signed_intents: true  # Reject unsigned intents
+sandbox_strictness: "hard"    # soft | hard | vm
