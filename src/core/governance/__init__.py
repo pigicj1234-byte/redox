@@ -27,6 +27,7 @@ from .engine import GovernanceEngine
 from .qos import AdaptiveQoSController, SystemMetrics, QoSAdjustment, LoadLevel
 from .circuit_breaker import CircuitBreaker, BreakerState
 from .audit import AuditChain, AuditEntry, compute_file_hash
+from .feedback import FeedbackLoop, FeedbackAction, FeedbackConfig, FeedbackState
 
 __all__ = [
     # Core
@@ -51,4 +52,9 @@ __all__ = [
     "AuditChain",
     "AuditEntry",
     "compute_file_hash",
+    # Feedback Loop
+    "FeedbackLoop",
+    "FeedbackAction",
+    "FeedbackConfig",
+    "FeedbackState",
 ]

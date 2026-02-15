@@ -149,6 +149,86 @@ class GovernanceEngine:
             self.logger.error("Failed to reload policy: %s", e)
             return False
 
+    def update_axes(
+        self,
+        performance: Optional[PerformanceProfile] = None,
+        security: Optional[SecurityPosture] = None,
+        mode: Optional[OperationalMode] = None,
+        reason: str = "",
+    ) -> None:
+        """Atomically swap one or more policy axes without touching YAML.
+
+        Used by the FeedbackLoop for auto-tuning. Since RuntimePolicy is frozen,
+        we create a new instance with the updated axes and swap it in.
+        All changes are audited.
+        """
+        from dataclasses import asdict
+
+        old = self.policy
+        changes = {}
+
+        new_perf = performance if performance is not None else old.performance_profile
+        new_sec = security if security is not None else old.security_posture
+        new_mode = mode if mode is not None else old.mode
+
+        if new_perf != old.performance_profile:
+            changes["performance_profile"] = f"{old.performance_profile.name} -> {new_perf.name}"
+        if new_sec != old.security_posture:
+            changes["security_posture"] = f"{old.security_posture.name} -> {new_sec.name}"
+        if new_mode != old.mode:
+            changes["mode"] = f"{old.mode.name} -> {new_mode.name}"
+
+        if not changes:
+            return
+
+        # Apply performance preset overrides
+        perf_preset = PERFORMANCE_PRESETS.get(new_perf, {})
+        new_cognitive_speed = perf_preset.get("cognitive_speed", old.cognitive_speed)
+        new_ssai_depth = perf_preset.get("ssai_depth", old.ssai_depth)
+        new_consensus_timeout = perf_preset.get("consensus_timeout_ms", old.consensus_timeout_ms)
+
+        # Apply security preset overrides
+        sec_preset = SECURITY_PRESETS.get(new_sec, {})
+        new_require_signed = sec_preset.get("require_signed_intents", old.require_signed_intents)
+        new_min_rep = sec_preset.get("min_reputation", old.min_reputation)
+        new_sandbox = sec_preset.get("sandbox_strictness", old.sandbox_strictness)
+
+        self.policy = RuntimePolicy(
+            mode=new_mode,
+            security_posture=new_sec,
+            performance_profile=new_perf,
+            cognitive_speed=new_cognitive_speed,
+            ssai_threshold=old.ssai_threshold,
+            ssai_depth=new_ssai_depth,
+            quorum_ratio=old.quorum_ratio,
+            consensus_timeout_ms=new_consensus_timeout,
+            max_fuel_per_intent=old.max_fuel_per_intent,
+            p2p_rate_limit=old.p2p_rate_limit,
+            require_signed_intents=new_require_signed,
+            sandbox_strictness=new_sandbox,
+            min_reputation=new_min_rep,
+            max_parallel_intents=old.max_parallel_intents,
+            queue_backpressure_threshold=old.queue_backpressure_threshold,
+            adaptive_throttling=old.adaptive_throttling,
+            allow_manual_override=old.allow_manual_override,
+            risk_weight_semantic=old.risk_weight_semantic,
+            risk_weight_behavioral=old.risk_weight_behavioral,
+            risk_weight_reputation=old.risk_weight_reputation,
+        )
+
+        # Audit
+        self.audit.append("axes_update", {
+            "changes": changes,
+            "reason": reason,
+            "source": "feedback_loop",
+        })
+
+        self.logger.info(
+            "Axes updated: %s | Reason: %s",
+            ", ".join(f"{k}: {v}" for k, v in changes.items()),
+            reason,
+        )
+
     def update_qos(self, metrics: SystemMetrics) -> QoSAdjustment:
         """Feed system metrics to QoS controller and cache adjustment."""
         self._last_qos = self.qos.evaluate(metrics)
