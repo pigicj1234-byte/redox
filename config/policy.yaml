@@ -1,26 +1,63 @@
 # =============================================================
-# Symbioz Runtime Policy
+# Symbioz Runtime Policy (Stage 3)
 # =============================================================
 # Edit this file to change system behavior without restart.
 # The GovernanceEngine hot-reloads on demand.
+#
+# Three independent axes:
+#   mode               - what the system does
+#   security_posture   - how defensive the system is
+#   performance_profile - speed vs thoroughness tradeoff
 #
 # Modes:
 #   development - max logging, relaxed thresholds, no signatures
 #   production  - strict invariants, rate-limiting, signed intents
 #   paranoid    - high consensus quorum, VM sandbox, minimal trust
 #   forensic   - read-only, deep analysis, replay-only
+#
+# Security Postures:
+#   open     - no signatures, no reputation checks
+#   guarded  - signatures required, basic reputation
+#   hardened - strict validation, elevated thresholds
+#   lockdown - maximum restrictions, minimal trust
+#
+# Performance Profiles:
+#   eco      - minimal resources, shallow analysis
+#   balanced - default operating point
+#   turbo    - deep analysis, high throughput
 # =============================================================
 
+# --- Core Axes ---
 mode: "production"
-cognitive_speed: 1.0          # Processing speed multiplier (0.5 - 4.0)
+security_posture: "guarded"
+performance_profile: "balanced"
 
-# Consensus & SSAI
-ssai_threshold: 0.7           # AI confidence required (0.0 - 1.0)
-quorum_ratio: 0.67            # 2/3 node votes required
-consensus_timeout_ms: 2500    # Max wait for consensus (ms)
+# --- Service Quality ---
+cognitive_speed: 1.0              # Processing speed multiplier (0.5 - 4.0)
 
-# Security & Resources
-max_fuel_per_intent: 350000   # Computation limit per intent
-p2p_rate_limit: 150           # Requests/sec per peer
-require_signed_intents: true  # Reject unsigned intents
-sandbox_strictness: "hard"    # soft | hard | vm
+# --- Consensus & SSAI ---
+ssai_threshold: 0.7               # AI confidence required (0.0 - 1.0)
+ssai_depth: "normal"              # shallow | normal | deep
+quorum_ratio: 0.67                # 2/3 node votes required
+consensus_timeout_ms: 2500        # Max wait for consensus (ms)
+
+# --- Security & Resources ---
+max_fuel_per_intent: 350000       # Computation limit per intent
+p2p_rate_limit: 150               # Requests/sec per peer
+require_signed_intents: true      # Reject unsigned intents
+sandbox_strictness: "hard"        # soft | hard | vm
+min_reputation: 0.2               # Minimum actor reputation (0.0 - 1.0)
+
+# --- QoS (Adaptive Quality of Service) ---
+max_parallel_intents: 20          # Max concurrent intent evaluations
+queue_backpressure_threshold: 100 # Queue depth before throttling kicks in
+adaptive_throttling: true         # Auto-reduce speed under load
+
+# --- Human Override ---
+allow_manual_override: true       # Allow human-in-the-loop decisions
+
+# --- Risk Weights (weighted aggregation model) ---
+# Must sum to 1.0
+risk_weight_semantic: 0.5         # Weight for semantic risk
+risk_weight_behavioral: 0.3       # Weight for behavioral risk
+risk_weight_reputation: 0.2       # Weight for (1 - actor_reputation)
