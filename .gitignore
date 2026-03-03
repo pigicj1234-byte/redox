@@ -23,3 +23,5 @@ target
 wget-log
 # Python bytecode cache
 __pycache__/
+# Governance runtime data (PanicSwitch lock files)
+/data/
