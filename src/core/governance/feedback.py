@@ -21,6 +21,7 @@ Design decisions (from debugging):
 
 import time
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, List
 
@@ -108,6 +109,9 @@ class FeedbackConfig:
     ema_alpha: float = 0.1
     ema_warmup: int = 10
 
+    # Spike filtering — observations beyond this z-score are dampened
+    zscore_spike_threshold: float = 4.0
+
 
 @dataclass
 class FeedbackAction:
@@ -149,9 +153,15 @@ class FeedbackLoop:
     """Adaptive controller that adjusts GovernanceEngine parameters
     based on real-time telemetry.
 
+    Thread-safe: all state mutations are protected by a reentrant lock.
+
     Uses EMA for streaming statistics — no windowed buffers, no reservoir
     p95 dependency. EMA recovers faster after spikes than reservoir-based
     percentiles (which keep all historical samples).
+
+    Z-score spike filtering: extreme latency outliers (|z| > threshold) are
+    dampened before updating EMA, preventing a single spike from dominating
+    the mean. The raw value is still recorded in MetricsCollector.
 
     Does NOT import GovernanceEngine — returns FeedbackAction objects
     that the caller applies, avoiding circular dependency.
@@ -167,6 +177,7 @@ class FeedbackLoop:
         self.config = config or FeedbackConfig()
         self.audit = audit
         self.logger = logging.getLogger("FeedbackLoop")
+        self._lock = threading.RLock()
 
         self._latency_ema = EMATracker(
             alpha=self.config.ema_alpha,
@@ -177,18 +188,49 @@ class FeedbackLoop:
             warmup=self.config.ema_warmup,
         )
         self._observation_count: int = 0
+        self._spike_count: int = 0
         self._last_action_time: float = 0.0  # 0 = never acted, allows first eval
         self._total_adaptations: int = 0
         self._last_action_name: str = "none"
         self._epochs: List[EpochRecord] = []
 
     def observe(self, latency_ms: float, rejected: bool) -> None:
-        """Feed a single observation. Call after every intent."""
-        self._observation_count += 1
-        self._latency_ema.update(latency_ms)
-        self._rejection_ema.update(1.0 if rejected else 0.0)
+        """Feed a single observation. Call after every intent.
 
-        # Feed MetricsCollector for dashboard visibility
+        Z-score spike filtering: if the EMA is warm and the latency has
+        |z-score| > threshold, the EMA receives a clamped value instead
+        of the raw outlier. MetricsCollector always gets the raw value.
+        """
+        with self._lock:
+            self._observation_count += 1
+
+            # Spike filtering for latency EMA
+            damped_latency = latency_ms
+            if self._latency_ema.is_warm:
+                mean = self._latency_ema.mean
+                sd = self._latency_ema.stddev
+                if sd < 1e-9:
+                    # Near-constant baseline: any large deviation is a spike
+                    # Use 1% of mean as minimum stddev proxy
+                    sd_proxy = max(abs(mean) * 0.01, 1.0)
+                    z = (latency_ms - mean) / sd_proxy
+                else:
+                    z = (latency_ms - mean) / sd
+
+                if abs(z) > self.config.zscore_spike_threshold:
+                    self._spike_count += 1
+                    # Clamp to threshold boundary instead of feeding raw spike
+                    clamp_sd = sd if sd >= 1e-9 else max(abs(mean) * 0.01, 1.0)
+                    damped_latency = (
+                        mean
+                        + self.config.zscore_spike_threshold * clamp_sd
+                        * (1.0 if z > 0 else -1.0)
+                    )
+
+            self._latency_ema.update(damped_latency)
+            self._rejection_ema.update(1.0 if rejected else 0.0)
+
+        # Feed MetricsCollector with raw value (outside lock — no shared state)
         self.metrics.observe("intent_latency_ms", latency_ms)
         self.metrics.inc_counter("intents_total")
         if rejected:
@@ -205,80 +247,82 @@ class FeedbackLoop:
         """Evaluate telemetry and return action if adaptation needed.
 
         Returns None if: not enough data, in cooldown, or no change needed.
+        Thread-safe: reads state under lock.
         """
-        now = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
 
-        # Cooldown: skip if last action was recent (but allow first-ever evaluation)
-        if self._last_action_time > 0 and (now - self._last_action_time) < self.config.cooldown_s:
-            return None
+            # Cooldown: skip if last action was recent (but allow first-ever evaluation)
+            if self._last_action_time > 0 and (now - self._last_action_time) < self.config.cooldown_s:
+                return None
 
-        # Minimum observations
-        if self._observation_count < self.config.min_observations:
-            return None
+            # Minimum observations
+            if self._observation_count < self.config.min_observations:
+                return None
 
-        avg_latency = self._latency_ema.mean
-        rejection_rate = self._rejection_ema.mean
+            avg_latency = self._latency_ema.mean
+            rejection_rate = self._rejection_ema.mean
 
-        # --- Performance adaptation ---
-        # Overload → ECO
-        if cpu_usage > self.config.cpu_overload or avg_latency > self.config.latency_overload_ms:
-            if current_performance != PerformanceProfile.ECO:
+            # --- Performance adaptation ---
+            # Overload → ECO
+            if cpu_usage > self.config.cpu_overload or avg_latency > self.config.latency_overload_ms:
+                if current_performance != PerformanceProfile.ECO:
+                    reason = (
+                        f"Overload (CPU={cpu_usage:.0%}, latency={avg_latency:.0f}ms)"
+                    )
+                    self.logger.warning(reason)
+                    return self._make_action(
+                        "performance_downshift", now,
+                        avg_latency, rejection_rate, cpu_usage,
+                        current_performance.name, current_security.name,
+                        performance=PerformanceProfile.ECO, reason=reason,
+                    )
+
+            # Idle → BALANCED (only from ECO, conservative)
+            if (
+                cpu_usage < self.config.cpu_idle
+                and avg_latency < self.config.latency_healthy_ms
+                and current_performance == PerformanceProfile.ECO
+            ):
                 reason = (
-                    f"Overload (CPU={cpu_usage:.0%}, latency={avg_latency:.0f}ms)"
+                    f"Idle (CPU={cpu_usage:.0%}, latency={avg_latency:.0f}ms)"
                 )
-                self.logger.warning(reason)
+                self.logger.info(reason)
                 return self._make_action(
-                    "performance_downshift", now,
+                    "performance_upshift", now,
                     avg_latency, rejection_rate, cpu_usage,
                     current_performance.name, current_security.name,
-                    performance=PerformanceProfile.ECO, reason=reason,
+                    performance=PerformanceProfile.BALANCED, reason=reason,
                 )
 
-        # Idle → BALANCED (only from ECO, conservative)
-        if (
-            cpu_usage < self.config.cpu_idle
-            and avg_latency < self.config.latency_healthy_ms
-            and current_performance == PerformanceProfile.ECO
-        ):
-            reason = (
-                f"Idle (CPU={cpu_usage:.0%}, latency={avg_latency:.0f}ms)"
-            )
-            self.logger.info(reason)
-            return self._make_action(
-                "performance_upshift", now,
-                avg_latency, rejection_rate, cpu_usage,
-                current_performance.name, current_security.name,
-                performance=PerformanceProfile.BALANCED, reason=reason,
-            )
+            # --- Security adaptation ---
+            # High rejection → LOCKDOWN
+            if rejection_rate > self.config.rejection_rate_lockdown:
+                if current_security != SecurityPosture.LOCKDOWN:
+                    reason = f"High rejection rate ({rejection_rate:.0%})"
+                    self.logger.critical(reason)
+                    return self._make_action(
+                        "security_lockdown", now,
+                        avg_latency, rejection_rate, cpu_usage,
+                        current_performance.name, current_security.name,
+                        security=SecurityPosture.LOCKDOWN, reason=reason,
+                    )
 
-        # --- Security adaptation ---
-        # High rejection → LOCKDOWN
-        if rejection_rate > self.config.rejection_rate_lockdown:
-            if current_security != SecurityPosture.LOCKDOWN:
-                reason = f"High rejection rate ({rejection_rate:.0%})"
-                self.logger.critical(reason)
+            # Recovery → GUARDED (only from LOCKDOWN, hysteresis)
+            if (
+                rejection_rate < self.config.rejection_rate_recovery
+                and current_security == SecurityPosture.LOCKDOWN
+            ):
+                reason = f"Rejection rate normalized ({rejection_rate:.0%})"
+                self.logger.info(reason)
                 return self._make_action(
-                    "security_lockdown", now,
+                    "security_recovery", now,
                     avg_latency, rejection_rate, cpu_usage,
                     current_performance.name, current_security.name,
-                    security=SecurityPosture.LOCKDOWN, reason=reason,
+                    security=SecurityPosture.GUARDED, reason=reason,
                 )
 
-        # Recovery → GUARDED (only from LOCKDOWN, hysteresis)
-        if (
-            rejection_rate < self.config.rejection_rate_recovery
-            and current_security == SecurityPosture.LOCKDOWN
-        ):
-            reason = f"Rejection rate normalized ({rejection_rate:.0%})"
-            self.logger.info(reason)
-            return self._make_action(
-                "security_recovery", now,
-                avg_latency, rejection_rate, cpu_usage,
-                current_performance.name, current_security.name,
-                security=SecurityPosture.GUARDED, reason=reason,
-            )
-
-        return None
+            return None
 
     def _make_action(
         self, name, now, avg_latency, rejection_rate, cpu_usage,
@@ -333,13 +377,20 @@ class FeedbackLoop:
             current_rejection_rate=self._rejection_ema.mean if self._rejection_ema.is_warm else None,
         )
 
+    @property
+    def spike_count(self) -> int:
+        with self._lock:
+            return self._spike_count
+
     def status(self) -> dict:
         """Status snapshot for monitoring/dashboard."""
-        return {
-            "total_adaptations": self._total_adaptations,
-            "last_action": self._last_action_name,
-            "observations": self._observation_count,
-            "avg_latency": self._latency_ema.mean if self._latency_ema.is_warm else None,
-            "rejection_rate": self._rejection_ema.mean if self._rejection_ema.is_warm else None,
-            "epochs": len(self._epochs),
-        }
+        with self._lock:
+            return {
+                "total_adaptations": self._total_adaptations,
+                "last_action": self._last_action_name,
+                "observations": self._observation_count,
+                "spikes_dampened": self._spike_count,
+                "avg_latency": self._latency_ema.mean if self._latency_ema.is_warm else None,
+                "rejection_rate": self._rejection_ema.mean if self._rejection_ema.is_warm else None,
+                "epochs": len(self._epochs),
+            }

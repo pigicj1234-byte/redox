@@ -16,13 +16,19 @@ Stage 3 additions:
 
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import List
+
+
+def _trace_id() -> str:
+    return uuid.uuid4().hex[:12]
 
 
 @dataclass
 class DecisionTrace:
     intent_id: str
+    trace_id: str = field(default_factory=_trace_id)
     timestamp: float = field(default_factory=time.time)
     mode_snapshot: str = "unknown"
     security_posture: str = "unknown"
@@ -102,6 +108,7 @@ class DecisionTrace:
         """Return structured JSON for `symbioz explain <id>` CLI command."""
         result = {
             "id": self.intent_id,
+            "trace_id": self.trace_id,
             "decision": self.decision,
             "confidence": f"{self.confidence_score * 100:.1f}%",
             "uncertainty": f"{self.uncertainty:.3f}",
@@ -134,6 +141,7 @@ class DecisionTrace:
         """Serialize for audit log storage."""
         return {
             "intent_id": self.intent_id,
+            "trace_id": self.trace_id,
             "timestamp": self.timestamp,
             "mode": self.mode_snapshot,
             "security_posture": self.security_posture,

@@ -503,6 +503,232 @@ test("int_history", _int_history)
 
 
 # ===========================================================================
+# Spike Filtering
+# ===========================================================================
+section("Spike Filtering")
+
+
+def _spike_dampen():
+    """Extreme spike is dampened — EMA mean stays reasonable."""
+    mc = MetricsCollector()
+    cfg = FeedbackConfig(
+        cooldown_s=0.0, min_observations=5, ema_alpha=0.1,
+        ema_warmup=5, zscore_spike_threshold=3.0,
+    )
+    fl = FeedbackLoop(metrics=mc, config=cfg)
+    # Build baseline at 100ms
+    for _ in range(20):
+        fl.observe(100.0, False)
+    mean_before = fl._latency_ema.mean
+    # Inject extreme spike
+    fl.observe(50000.0, False)
+    mean_after = fl._latency_ema.mean
+    # Without filtering mean would jump to ~4500+. With filtering it stays sane.
+    assert mean_after < 500, f"Spike not dampened: mean={mean_after:.1f}"
+    assert fl.spike_count == 1
+
+test("dampen", _spike_dampen)
+
+
+def _spike_count():
+    """Multiple spikes are counted."""
+    mc = MetricsCollector()
+    cfg = FeedbackConfig(
+        cooldown_s=0.0, min_observations=3, ema_alpha=0.1,
+        ema_warmup=3, zscore_spike_threshold=3.0,
+    )
+    fl = FeedbackLoop(metrics=mc, config=cfg)
+    for _ in range(10):
+        fl.observe(100.0, False)
+    fl.observe(99999.0, False)
+    fl.observe(99999.0, False)
+    fl.observe(99999.0, False)
+    assert fl.spike_count == 3
+
+test("count", _spike_count)
+
+
+def _spike_normal_passthrough():
+    """Normal observations within z-score threshold are not filtered."""
+    mc = MetricsCollector()
+    cfg = FeedbackConfig(
+        cooldown_s=0.0, min_observations=3, ema_alpha=0.1,
+        ema_warmup=3, zscore_spike_threshold=4.0,
+    )
+    fl = FeedbackLoop(metrics=mc, config=cfg)
+    # Build baseline with stddev ≈ 3.3 around mean ≈ 100
+    for v in [95, 105, 98, 102, 100, 97, 103, 99, 101, 96,
+              104, 98, 102, 100, 97, 103, 99, 101, 96, 105]:
+        fl.observe(float(v), False)
+    # 110ms → z ≈ 3.1 which is under threshold 4.0 → not filtered
+    fl.observe(110.0, False)
+    assert fl.spike_count == 0
+
+test("passthrough", _spike_normal_passthrough)
+
+
+# ===========================================================================
+# Thread Safety
+# ===========================================================================
+section("Thread Safety")
+
+
+def _thread_concurrent_observe():
+    """Concurrent observe() calls don't corrupt state."""
+    import threading
+    mc = MetricsCollector()
+    cfg = FeedbackConfig(cooldown_s=0.0, min_observations=5, ema_alpha=0.1)
+    fl = FeedbackLoop(metrics=mc, config=cfg)
+
+    def feed(n):
+        for i in range(n):
+            fl.observe(100.0 + i, False)
+
+    threads = [threading.Thread(target=feed, args=(100,)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert fl._observation_count == 400
+    assert fl._latency_ema.count == 400
+
+test("concurrent", _thread_concurrent_observe)
+
+
+def _thread_observe_evaluate():
+    """observe() and evaluate() can run concurrently without deadlock."""
+    import threading
+    mc = MetricsCollector()
+    cfg = FeedbackConfig(cooldown_s=0.0, min_observations=5, ema_alpha=0.3)
+    fl = FeedbackLoop(metrics=mc, config=cfg)
+    results = []
+
+    def observer():
+        for _ in range(200):
+            fl.observe(3000.0, False)
+
+    def evaluator():
+        for _ in range(50):
+            r = fl.evaluate(PerformanceProfile.BALANCED, SecurityPosture.GUARDED, cpu_usage=0.90)
+            if r is not None:
+                results.append(r)
+
+    t1 = threading.Thread(target=observer)
+    t2 = threading.Thread(target=evaluator)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    # Should not deadlock, and should have gotten at least one action
+    assert fl._observation_count == 200
+
+test("obs_eval", _thread_observe_evaluate)
+
+
+# ===========================================================================
+# Trace ID
+# ===========================================================================
+section("Trace ID")
+
+
+def _trace_id_unique():
+    """Each DecisionTrace gets a unique trace_id."""
+    from src.core.governance.trace import DecisionTrace
+    t1 = DecisionTrace(intent_id="a")
+    t2 = DecisionTrace(intent_id="b")
+    assert t1.trace_id != t2.trace_id
+    assert len(t1.trace_id) == 12
+
+test("unique", _trace_id_unique)
+
+
+def _trace_id_in_explain():
+    """trace_id appears in explain() output."""
+    from src.core.governance.trace import DecisionTrace
+    t = DecisionTrace(intent_id="test-1")
+    t.decision = "APPROVED"
+    t.compute_confidence()
+    output = t.explain()
+    assert t.trace_id in output
+
+test("in_explain", _trace_id_in_explain)
+
+
+def _trace_id_in_dict():
+    """trace_id appears in to_dict() for audit chain."""
+    from src.core.governance.trace import DecisionTrace
+    t = DecisionTrace(intent_id="test-2")
+    d = t.to_dict()
+    assert "trace_id" in d
+    assert d["trace_id"] == t.trace_id
+
+test("in_dict", _trace_id_in_dict)
+
+
+# ===========================================================================
+# Risk Scoring Fix
+# ===========================================================================
+section("Risk Scoring")
+
+
+def _risk_unsigned_rejected():
+    """Unsigned intent rejected at step 5 should have risk_score=1.0, not 0.0."""
+    gov = _make_engine()
+    result = gov.evaluate_intent({
+        "action": "deploy", "actor": "x",
+        "reputation": 0.9, "signature": None,
+    })
+    assert result.decision == "REJECTED"
+    assert result.risk_score == 1.0
+    assert result.recommended_action == "block"
+
+test("unsigned", _risk_unsigned_rejected)
+
+
+def _risk_low_rep_rejected():
+    """Low reputation rejected at step 6 should have risk_score=0.9."""
+    gov = _make_engine()
+    result = gov.evaluate_intent({
+        "action": "transfer", "actor": "shady",
+        "reputation": 0.01, "signature": "sig:ok",
+    })
+    assert result.decision == "REJECTED"
+    assert result.risk_score == 0.9
+    assert result.recommended_action == "block"
+
+test("low_rep", _risk_low_rep_rejected)
+
+
+def _risk_normal_approved():
+    """Normal intent should have low risk and high confidence."""
+    gov = _make_engine()
+    result = gov.evaluate_intent({
+        "action": "transfer", "actor": "trusted",
+        "reputation": 0.95, "signature": "sig:ok",
+    })
+    assert result.decision == "APPROVED"
+    assert result.risk_score < 0.3
+    assert result.confidence_score > 0.7
+
+test("normal", _risk_normal_approved)
+
+
+def _risk_reputation_from_intent():
+    """Engine should extract reputation from intent_data dict."""
+    gov = _make_engine()
+    # Low rep in intent_data (not passed as kwarg)
+    result = gov.evaluate_intent({
+        "action": "transfer", "actor": "x",
+        "reputation": 0.01, "signature": "sig:ok",
+    })
+    assert result.decision == "REJECTED"
+    assert result.actor_reputation == 0.01
+
+test("rep_extract", _risk_reputation_from_intent)
+
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 

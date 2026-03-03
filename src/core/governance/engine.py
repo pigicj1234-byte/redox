@@ -237,7 +237,7 @@ class GovernanceEngine:
     def evaluate_intent(
         self,
         intent_data: dict,
-        actor_reputation: float = 1.0,
+        actor_reputation: float = -1.0,
         is_panic: bool = False,
     ) -> DecisionTrace:
         """Evaluate an intent against current policy with full Stage 3 pipeline.
@@ -255,6 +255,10 @@ class GovernanceEngine:
          10. Weighted confidence aggregation
          11. Decision + audit log
         """
+        # Extract reputation from intent_data if not explicitly passed
+        if actor_reputation < 0:
+            actor_reputation = float(intent_data.get("reputation", 1.0))
+
         trace = DecisionTrace(
             intent_id=intent_data.get("id", "unknown"),
             mode_snapshot=self.policy.mode.name,
@@ -268,6 +272,8 @@ class GovernanceEngine:
         # 1. Panic override
         if is_panic:
             trace.decision = "REJECTED"
+            trace.risk_score = 1.0
+            trace.recommended_action = "block"
             trace.add_reason("PANIC mode active — all intents blocked")
             self._finalize(trace)
             return trace
@@ -275,6 +281,8 @@ class GovernanceEngine:
         # 2. FORENSIC mode — read-only
         if self.policy.mode == OperationalMode.FORENSIC:
             trace.decision = "REJECTED"
+            trace.risk_score = 1.0
+            trace.recommended_action = "block"
             trace.add_reason("System is in FORENSIC mode (read-only)")
             self._finalize(trace)
             return trace
@@ -299,6 +307,7 @@ class GovernanceEngine:
         if require_sig and not intent_data.get("signature"):
             trace.decision = "REJECTED"
             trace.risk_score = 1.0
+            trace.recommended_action = "block"
             trace.add_reason(
                 f"Missing signature (required by {self.policy.security_posture.name} posture)"
             )
@@ -310,6 +319,7 @@ class GovernanceEngine:
         if actor_reputation < min_rep:
             trace.decision = "REJECTED"
             trace.risk_score = 0.9
+            trace.recommended_action = "block"
             trace.add_reason(
                 f"Actor reputation {actor_reputation:.2f} below "
                 f"{self.policy.security_posture.name} minimum {min_rep:.2f}"
@@ -331,6 +341,7 @@ class GovernanceEngine:
         estimated_fuel = intent_data.get("fuel_estimate", 0)
         if estimated_fuel > effective_fuel:
             trace.decision = "REJECTED"
+            trace.recommended_action = "block"
             trace.add_reason(
                 f"Fuel limit exceeded ({estimated_fuel:,} > {effective_fuel:,}"
                 f" [base {self.policy.max_fuel_per_intent:,} "
@@ -388,8 +399,12 @@ class GovernanceEngine:
         return trace
 
     def _finalize(self, trace: DecisionTrace) -> None:
-        """Finalize a decision: compute confidence if needed, log to audit."""
-        if trace.confidence_score == 0.0 and trace.decision != "PENDING":
+        """Finalize a decision: compute confidence if needed, log to audit.
+
+        Skips confidence recomputation if risk_score was already set manually
+        (e.g., by early rejection at step 5/6) — prevents overwriting with 0.0.
+        """
+        if trace.confidence_score == 0.0 and trace.risk_score == 0.0 and trace.decision != "PENDING":
             trace.compute_confidence(
                 w_semantic=self.policy.risk_weight_semantic,
                 w_behavioral=self.policy.risk_weight_behavioral,
