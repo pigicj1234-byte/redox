@@ -21,3 +21,5 @@ source.tar
 source.tar.tmp
 target
 wget-log
+# Python bytecode cache
+__pycache__/
