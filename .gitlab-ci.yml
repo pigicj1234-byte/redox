@@ -27,6 +27,13 @@ cargo-test:
     - apt update && apt install -y fuse3 libfuse3-dev
     - cargo test --locked
 
+governance-test:
+  image: "python:3.12-slim"
+  stage: test
+  script:
+    - pip install pyyaml
+    - python tests/test_feedback.py
+
 img:
   image: "ubuntu:24.04"
   stage: test
